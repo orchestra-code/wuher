@@ -125,6 +125,73 @@ export interface ParsedUserAgentBlock {
 }
 
 // ============================================================================
+// Cloudflare Detection Types
+// ============================================================================
+
+/**
+ * Result of checking an HTTP response for Cloudflare bot protection.
+ *
+ * Cloudflare's managed challenge intercepts non-browser requests and returns
+ * a JavaScript challenge page instead of the actual content. This is common
+ * for sites using Cloudflare's Bot Management or "Under Attack" mode.
+ */
+export interface CloudflareDetectionResult {
+  /** Whether a Cloudflare challenge/block was detected */
+  isCloudflareProtected: boolean;
+  /** The type of protection detected, if any */
+  protectionType?: "managed_challenge" | "js_challenge" | "block" | "turnstile";
+  /** Whether the site supports Web Bot Auth for verified bot access */
+  supportsWebBotAuth?: boolean;
+}
+
+// ============================================================================
+// Sitemap Extraction Types
+// ============================================================================
+
+/**
+ * Result of extracting sitemap URLs from robots.txt
+ */
+export interface SitemapExtractionResult {
+  /** Sitemap URLs found in Sitemap: directives */
+  sitemapUrls: string[];
+}
+
+// ============================================================================
+// Web Bot Auth Types
+// ============================================================================
+
+/**
+ * Configuration for Cloudflare Web Bot Auth.
+ *
+ * Web Bot Auth uses HTTP Message Signatures (RFC 9421) with Ed25519 keys
+ * to cryptographically verify that a request comes from a known bot.
+ *
+ * This type describes the configuration a bot operator needs to set up.
+ * Wuher does not handle key generation or request signing — use the
+ * `web-bot-auth` npm package from Cloudflare for that.
+ *
+ * @see https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/
+ */
+export interface WebBotAuthConfig {
+  /** URL of the bot's key directory (must be at /.well-known/http-message-signatures-directory) */
+  keyDirectoryUrl: string;
+  /** JWK thumbprint of the Ed25519 signing key */
+  keyId: string;
+  /** The User-Agent string the bot sends */
+  userAgent: string;
+}
+
+/**
+ * The HTTP headers required for a Web Bot Auth signed request.
+ * These are produced by the signing process and attached to each request.
+ */
+export interface WebBotAuthHeaders {
+  "Signature-Agent": string;
+  "Signature-Input": string;
+  "Signature": string;
+}
+
+// ============================================================================
 // Default Bot Patterns
 // ============================================================================
 
@@ -758,6 +825,220 @@ export function listUserAgents(robotsTxt: string): string[] {
 }
 
 // ============================================================================
+// Sitemap Extraction
+// ============================================================================
+
+/**
+ * Extract sitemap URLs from robots.txt content.
+ *
+ * The `Sitemap:` directive is defined in the sitemaps protocol and can appear
+ * anywhere in a robots.txt file. It is not user-agent-specific. Multiple
+ * Sitemap directives are allowed and common.
+ *
+ * @param robotsTxt - Raw robots.txt content
+ * @returns Extraction result with array of sitemap URLs
+ *
+ * @example
+ * ```typescript
+ * import { extractSitemaps } from 'wuher';
+ *
+ * const robotsTxt = `
+ * User-agent: *
+ * Disallow: /private/
+ *
+ * Sitemap: https://example.com/sitemap.xml
+ * Sitemap: https://example.com/sitemap-news.xml
+ * `;
+ *
+ * const result = extractSitemaps(robotsTxt);
+ * console.log(result.sitemapUrls);
+ * // ['https://example.com/sitemap.xml', 'https://example.com/sitemap-news.xml']
+ * ```
+ */
+export function extractSitemaps(robotsTxt: string): SitemapExtractionResult {
+  const sitemapUrls: string[] = [];
+  const lines = robotsTxt.split("\n");
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // Skip comments and empty lines
+    if (!trimmed || trimmed.startsWith("#")) continue;
+
+    if (/^sitemap\s*:/i.test(trimmed)) {
+      const url = trimmed.replace(/^sitemap\s*:\s*/i, "").trim();
+      if (url && (url.startsWith("http://") || url.startsWith("https://"))) {
+        sitemapUrls.push(url);
+      }
+    }
+  }
+
+  return { sitemapUrls };
+}
+
+// ============================================================================
+// Cloudflare Detection
+// ============================================================================
+
+/**
+ * Markers that identify Cloudflare challenge/protection pages.
+ * These are stable identifiers found in Cloudflare's challenge HTML.
+ */
+const CLOUDFLARE_MARKERS = {
+  js_challenge: [
+    "cf_chl_jschl",
+    "jschl_vc",
+    "jschl_answer",
+  ],
+  managed_challenge: [
+    "cf_chl_opt",
+    "cf-browser-verification",
+    "/cdn-cgi/challenge-platform",
+  ],
+  turnstile: [
+    "cf-turnstile",
+    "challenges.cloudflare.com/turnstile",
+  ],
+  block: [
+    "cf-error-details",
+    "error code: 1020",
+    "cf.error.1020",
+  ],
+} as const;
+
+/**
+ * Detect whether an HTTP response body contains a Cloudflare bot challenge.
+ *
+ * When a site uses Cloudflare's Bot Management, non-browser requests often
+ * receive a JavaScript challenge page instead of the actual content. This
+ * function inspects the response body for known Cloudflare challenge markers.
+ *
+ * @param responseBody - The HTML response body to inspect
+ * @param responseHeaders - Optional response headers (checks for `cf-ray`, `server: cloudflare`)
+ * @returns Detection result indicating whether Cloudflare protection was found
+ *
+ * @example
+ * ```typescript
+ * import { detectCloudflareChallenge } from 'wuher';
+ *
+ * const response = await fetch('https://example.com/robots.txt');
+ * const body = await response.text();
+ *
+ * const detection = detectCloudflareChallenge(body, {
+ *   server: response.headers.get('server') ?? undefined,
+ *   cfRay: response.headers.get('cf-ray') ?? undefined,
+ * });
+ *
+ * if (detection.isCloudflareProtected) {
+ *   console.log(`Blocked by Cloudflare: ${detection.protectionType}`);
+ *   if (detection.supportsWebBotAuth) {
+ *     console.log('This site may accept Web Bot Auth signed requests');
+ *   }
+ * }
+ * ```
+ */
+export function detectCloudflareChallenge(
+  responseBody: string,
+  responseHeaders?: {
+    server?: string;
+    cfRay?: string;
+  }
+): CloudflareDetectionResult {
+  const bodyLower = responseBody.toLowerCase();
+  const isCloudflareServer =
+    responseHeaders?.server?.toLowerCase().includes("cloudflare") ||
+    responseHeaders?.cfRay !== undefined;
+
+  // Check each type in order of specificity (more specific markers first)
+  const checkOrder: Array<{ type: CloudflareDetectionResult["protectionType"]; markers: readonly string[] }> = [
+    { type: "js_challenge", markers: CLOUDFLARE_MARKERS.js_challenge },
+    { type: "turnstile", markers: CLOUDFLARE_MARKERS.turnstile },
+    { type: "managed_challenge", markers: CLOUDFLARE_MARKERS.managed_challenge },
+    { type: "block", markers: CLOUDFLARE_MARKERS.block },
+  ];
+
+  for (const { type, markers } of checkOrder) {
+    for (const marker of markers) {
+      if (bodyLower.includes(marker.toLowerCase())) {
+        return {
+          isCloudflareProtected: true,
+          protectionType: type,
+          supportsWebBotAuth: isCloudflareServer || undefined,
+        };
+      }
+    }
+  }
+
+  return { isCloudflareProtected: false };
+}
+
+// ============================================================================
+// Web Bot Auth Helpers
+// ============================================================================
+
+/**
+ * Build the well-known URL for a domain's HTTP Message Signatures directory.
+ *
+ * This is the URL where a bot operator hosts their public signing keys,
+ * following the IETF draft for HTTP Message Signatures directories.
+ *
+ * @param domain - The domain hosting the key directory (e.g., "mybot.example.com")
+ * @returns The full well-known URL
+ *
+ * @example
+ * ```typescript
+ * import { buildKeyDirectoryUrl } from 'wuher';
+ *
+ * const url = buildKeyDirectoryUrl('mybot.example.com');
+ * // 'https://mybot.example.com/.well-known/http-message-signatures-directory'
+ * ```
+ */
+export function buildKeyDirectoryUrl(domain: string): string {
+  const clean = domain.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  return `https://${clean}/.well-known/http-message-signatures-directory`;
+}
+
+/**
+ * Validate that a WebBotAuthConfig has the required fields.
+ *
+ * This performs basic structural validation — it does NOT verify the key
+ * or test connectivity. Use the `web-bot-auth` npm package for full
+ * signing and verification.
+ *
+ * @param config - The config to validate
+ * @returns An object with `valid` boolean and optional `errors` array
+ */
+export function validateWebBotAuthConfig(
+  config: Partial<WebBotAuthConfig>
+): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+
+  if (!config.keyDirectoryUrl) {
+    errors.push("keyDirectoryUrl is required");
+  } else if (!config.keyDirectoryUrl.startsWith("https://")) {
+    errors.push("keyDirectoryUrl must use HTTPS");
+  } else if (
+    !config.keyDirectoryUrl.includes(
+      "/.well-known/http-message-signatures-directory"
+    )
+  ) {
+    errors.push(
+      "keyDirectoryUrl should end with /.well-known/http-message-signatures-directory"
+    );
+  }
+
+  if (!config.keyId) {
+    errors.push("keyId (JWK thumbprint) is required");
+  }
+
+  if (!config.userAgent) {
+    errors.push("userAgent is required");
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+// ============================================================================
 // Convenience Exports
 // ============================================================================
 
@@ -769,6 +1050,10 @@ export default {
   listUserAgents,
   hasWildcardDisallow,
   findBlockedBots,
+  extractSitemaps,
+  detectCloudflareChallenge,
+  buildKeyDirectoryUrl,
+  validateWebBotAuthConfig,
   DEFAULT_RED_PATTERNS,
   DEFAULT_YELLOW_PATTERNS,
 };

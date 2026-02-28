@@ -219,6 +219,154 @@ const blocks = parseRobotsTxt(robotsTxt);
 const blocked = findBlockedBots(blocks, DEFAULT_RED_PATTERNS);
 ```
 
+### `extractSitemaps(robotsTxt)`
+
+Extract sitemap URLs from `Sitemap:` directives in a robots.txt file.
+
+```typescript
+import { extractSitemaps } from 'wuher';
+
+const robotsTxt = `
+User-agent: *
+Disallow: /private/
+
+Sitemap: https://example.com/sitemap.xml
+Sitemap: https://example.com/sitemap-news.xml
+`;
+
+const { sitemapUrls } = extractSitemaps(robotsTxt);
+console.log(sitemapUrls);
+// ['https://example.com/sitemap.xml', 'https://example.com/sitemap-news.xml']
+```
+
+Not all sites put their sitemap at `/sitemap.xml`. Many declare the location in robots.txt using the `Sitemap:` directive. Use this function to find sitemaps when the well-known path doesn't work.
+
+### `detectCloudflareChallenge(responseBody, responseHeaders?)`
+
+Detect whether an HTTP response is a Cloudflare bot challenge instead of actual content.
+
+```typescript
+import { detectCloudflareChallenge } from 'wuher';
+
+const response = await fetch('https://example.com/robots.txt');
+const body = await response.text();
+
+const detection = detectCloudflareChallenge(body, {
+  server: response.headers.get('server') ?? undefined,
+  cfRay: response.headers.get('cf-ray') ?? undefined,
+});
+
+if (detection.isCloudflareProtected) {
+  console.log(`Blocked by Cloudflare: ${detection.protectionType}`);
+  // protectionType: 'managed_challenge' | 'js_challenge' | 'turnstile' | 'block'
+  
+  if (detection.supportsWebBotAuth) {
+    console.log('This site may accept Web Bot Auth signed requests');
+  }
+}
+```
+
+This is useful when fetching robots.txt or sitemaps programmatically. Many sites behind Cloudflare return a JavaScript challenge page (the "Just a moment..." page) instead of the actual content, even with a legitimate User-Agent. The detection identifies four types of Cloudflare protection:
+
+| Type | Description |
+|------|-------------|
+| `managed_challenge` | Standard Cloudflare challenge page ("Just a moment...") |
+| `js_challenge` | Legacy JavaScript challenge |
+| `turnstile` | Cloudflare Turnstile CAPTCHA |
+| `block` | Direct block (Error 1020: Access Denied) |
+
+## Cloudflare Web Bot Auth
+
+Sites protected by Cloudflare can use [Web Bot Auth](https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/) to allow verified bots through their protection. Web Bot Auth uses HTTP Message Signatures ([RFC 9421](https://www.rfc-editor.org/rfc/rfc9421)) with Ed25519 keys to cryptographically prove a request comes from a known bot.
+
+Wuher provides types and validation helpers for Web Bot Auth configuration. **Wuher does not handle key generation or request signing** — use Cloudflare's [`web-bot-auth`](https://www.npmjs.com/package/web-bot-auth) npm package for that.
+
+### How It Works
+
+1. **You generate** an Ed25519 key pair
+2. **You host** a [key directory](https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/#2-host-a-key-directory) at `/.well-known/http-message-signatures-directory` on your bot's domain
+3. **You register** with Cloudflare via the Bot Submission Form
+4. **Your bot signs** each request with `Signature`, `Signature-Input`, and `Signature-Agent` headers
+
+### Wuher Helpers
+
+```typescript
+import {
+  buildKeyDirectoryUrl,
+  validateWebBotAuthConfig,
+  detectCloudflareChallenge,
+  type WebBotAuthConfig,
+  type WebBotAuthHeaders,
+} from 'wuher';
+
+// Build the well-known URL for your key directory
+const directoryUrl = buildKeyDirectoryUrl('mybot.example.com');
+// 'https://mybot.example.com/.well-known/http-message-signatures-directory'
+
+// Validate your Web Bot Auth configuration
+const validation = validateWebBotAuthConfig({
+  keyDirectoryUrl: directoryUrl,
+  keyId: 'poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U',
+  userAgent: 'MyBot/1.0',
+});
+
+if (!validation.valid) {
+  console.error('Config errors:', validation.errors);
+}
+
+// Detect when Cloudflare is blocking your bot
+const response = await fetch('https://target-site.com/robots.txt');
+const body = await response.text();
+const detection = detectCloudflareChallenge(body, {
+  server: response.headers.get('server') ?? undefined,
+  cfRay: response.headers.get('cf-ray') ?? undefined,
+});
+
+if (detection.isCloudflareProtected && detection.supportsWebBotAuth) {
+  // This site is on Cloudflare and may accept signed requests.
+  // Use the `web-bot-auth` npm package to sign your requests:
+  //   npm install web-bot-auth
+  // See: https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/
+}
+```
+
+### Full Integration Example
+
+```typescript
+import { detectCloudflareChallenge, validateWebBotAuthConfig } from 'wuher';
+// For actual signing, use Cloudflare's package:
+// import { sign } from 'web-bot-auth';
+
+async function fetchWithBotAuth(url: string) {
+  // First attempt: normal fetch
+  const response = await fetch(url, {
+    headers: { 'User-Agent': 'MyBot/1.0' },
+  });
+  const body = await response.text();
+
+  // Check if blocked by Cloudflare
+  const detection = detectCloudflareChallenge(body, {
+    server: response.headers.get('server') ?? undefined,
+    cfRay: response.headers.get('cf-ray') ?? undefined,
+  });
+
+  if (!detection.isCloudflareProtected) {
+    return body; // Not blocked, use the response
+  }
+
+  if (!detection.supportsWebBotAuth) {
+    throw new Error('Blocked by Cloudflare, Web Bot Auth not available');
+  }
+
+  // Second attempt: signed request using web-bot-auth package
+  // const signedHeaders = await sign(url, privateKey, keyId, ...);
+  // const signedResponse = await fetch(url, { headers: signedHeaders });
+  // return await signedResponse.text();
+
+  throw new Error('Web Bot Auth signing not configured');
+}
+```
+
 ## Understanding Classifications
 
 Wuher classifies robots.txt restrictions into three levels based on their impact on your AI and search visibility:
@@ -428,6 +576,10 @@ import type {
   ParsedUserAgentBlock,
   Classification,
   ClassificationSeverity,
+  CloudflareDetectionResult,
+  SitemapExtractionResult,
+  WebBotAuthConfig,
+  WebBotAuthHeaders,
 } from 'wuher';
 ```
 

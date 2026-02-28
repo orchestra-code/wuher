@@ -13,6 +13,10 @@ import {
   listUserAgents,
   hasWildcardDisallow,
   findBlockedBots,
+  extractSitemaps,
+  detectCloudflareChallenge,
+  buildKeyDirectoryUrl,
+  validateWebBotAuthConfig,
   DEFAULT_RED_PATTERNS,
   DEFAULT_YELLOW_PATTERNS,
   type BotPattern,
@@ -578,5 +582,269 @@ Disallow: /admin/ # admin area
     expect(blocks).toHaveLength(1);
     // The value includes the comment text (this is technically correct per spec)
     expect(blocks[0].userAgents[0]).toContain("*");
+  });
+});
+
+// ============================================================================
+// extractSitemaps Tests
+// ============================================================================
+
+const ROBOTS_WITH_SITEMAPS = `
+User-agent: *
+Disallow: /private/
+
+Sitemap: https://example.com/sitemap.xml
+Sitemap: https://example.com/sitemap-news.xml
+Sitemap: https://example.com/sitemap-images.xml
+`;
+
+const ROBOTS_WITH_MIXED_CASE_SITEMAP = `
+User-agent: *
+Disallow:
+
+sitemap: https://example.com/lower.xml
+SITEMAP: https://example.com/upper.xml
+Sitemap: https://example.com/mixed.xml
+`;
+
+const ROBOTS_WITH_NO_SITEMAPS = `
+User-agent: *
+Disallow: /private/
+Allow: /public/
+`;
+
+describe("extractSitemaps", () => {
+  it("should extract sitemap URLs from robots.txt", () => {
+    const result = extractSitemaps(ROBOTS_WITH_SITEMAPS);
+    expect(result.sitemapUrls).toHaveLength(3);
+    expect(result.sitemapUrls).toContain("https://example.com/sitemap.xml");
+    expect(result.sitemapUrls).toContain("https://example.com/sitemap-news.xml");
+    expect(result.sitemapUrls).toContain("https://example.com/sitemap-images.xml");
+  });
+
+  it("should handle case-insensitive Sitemap directive", () => {
+    const result = extractSitemaps(ROBOTS_WITH_MIXED_CASE_SITEMAP);
+    expect(result.sitemapUrls).toHaveLength(3);
+    expect(result.sitemapUrls).toContain("https://example.com/lower.xml");
+    expect(result.sitemapUrls).toContain("https://example.com/upper.xml");
+    expect(result.sitemapUrls).toContain("https://example.com/mixed.xml");
+  });
+
+  it("should return empty array when no sitemaps are present", () => {
+    const result = extractSitemaps(ROBOTS_WITH_NO_SITEMAPS);
+    expect(result.sitemapUrls).toEqual([]);
+  });
+
+  it("should return empty array for empty robots.txt", () => {
+    const result = extractSitemaps("");
+    expect(result.sitemapUrls).toEqual([]);
+  });
+
+  it("should ignore invalid URLs in Sitemap directives", () => {
+    const robots = `
+Sitemap: https://example.com/valid.xml
+Sitemap: not-a-url
+Sitemap: ftp://example.com/bad-protocol.xml
+Sitemap: https://example.com/also-valid.xml
+`;
+    const result = extractSitemaps(robots);
+    expect(result.sitemapUrls).toHaveLength(2);
+    expect(result.sitemapUrls).toContain("https://example.com/valid.xml");
+    expect(result.sitemapUrls).toContain("https://example.com/also-valid.xml");
+  });
+
+  it("should handle Sitemap directives with extra whitespace", () => {
+    const robots = `
+Sitemap:   https://example.com/spaced.xml  
+Sitemap:	https://example.com/tabbed.xml
+`;
+    const result = extractSitemaps(robots);
+    expect(result.sitemapUrls).toHaveLength(2);
+    expect(result.sitemapUrls).toContain("https://example.com/spaced.xml");
+    expect(result.sitemapUrls).toContain("https://example.com/tabbed.xml");
+  });
+
+  it("should handle http:// sitemap URLs", () => {
+    const robots = `Sitemap: http://example.com/sitemap.xml`;
+    const result = extractSitemaps(robots);
+    expect(result.sitemapUrls).toHaveLength(1);
+    expect(result.sitemapUrls[0]).toBe("http://example.com/sitemap.xml");
+  });
+
+  it("should skip commented-out Sitemap directives", () => {
+    const robots = `
+# Sitemap: https://example.com/commented-out.xml
+Sitemap: https://example.com/real.xml
+`;
+    const result = extractSitemaps(robots);
+    expect(result.sitemapUrls).toHaveLength(1);
+    expect(result.sitemapUrls[0]).toBe("https://example.com/real.xml");
+  });
+});
+
+// ============================================================================
+// detectCloudflareChallenge Tests
+// ============================================================================
+
+const CF_MANAGED_CHALLENGE_HTML = `<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"></head><body><div class="main-wrapper" role="main"><div class="main-content"><noscript><div class="h2"><span id="challenge-error-text">Enable JavaScript and cookies to continue</span></div></noscript></div></div><script>(function(){window._cf_chl_opt = {cvId: '3',cZone: 'www.example.com',cType: 'managed'};var a = document.createElement('script');a.src = '/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1?ray=abc123';document.getElementsByTagName('head')[0].appendChild(a);}());</script></body></html>`;
+
+const CF_JS_CHALLENGE_HTML = `<html><head><title>Checking your browser</title></head><body><form id="challenge-form" action="/cdn-cgi/l/chk_jschl" method="get"><input name="jschl_vc" value="abc123"/><input name="jschl_answer"/></form></body></html>`;
+
+const CF_TURNSTILE_HTML = `<html><head><title>Verify you are human</title></head><body><div class="cf-turnstile" data-sitekey="0x4AAAA"></div><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></body></html>`;
+
+const CF_BLOCK_HTML = `<html><head><title>Access denied</title></head><body><div class="cf-error-details"><h1>Error 1020: Access Denied</h1></div></body></html>`;
+
+const NORMAL_HTML = `<!DOCTYPE html><html><head><title>Example</title></head><body><h1>Hello World</h1></body></html>`;
+
+const NORMAL_ROBOTS_TXT = `User-agent: *\nDisallow: /private/\n\nSitemap: https://example.com/sitemap.xml`;
+
+describe("detectCloudflareChallenge", () => {
+  it("should detect managed challenge", () => {
+    const result = detectCloudflareChallenge(CF_MANAGED_CHALLENGE_HTML);
+    expect(result.isCloudflareProtected).toBe(true);
+    expect(result.protectionType).toBe("managed_challenge");
+  });
+
+  it("should detect JS challenge", () => {
+    const result = detectCloudflareChallenge(CF_JS_CHALLENGE_HTML);
+    expect(result.isCloudflareProtected).toBe(true);
+    expect(result.protectionType).toBe("js_challenge");
+  });
+
+  it("should detect Turnstile challenge", () => {
+    const result = detectCloudflareChallenge(CF_TURNSTILE_HTML);
+    expect(result.isCloudflareProtected).toBe(true);
+    expect(result.protectionType).toBe("turnstile");
+  });
+
+  it("should detect Cloudflare block (1020)", () => {
+    const result = detectCloudflareChallenge(CF_BLOCK_HTML);
+    expect(result.isCloudflareProtected).toBe(true);
+    expect(result.protectionType).toBe("block");
+  });
+
+  it("should not flag normal HTML pages", () => {
+    const result = detectCloudflareChallenge(NORMAL_HTML);
+    expect(result.isCloudflareProtected).toBe(false);
+    expect(result.protectionType).toBeUndefined();
+  });
+
+  it("should not flag normal robots.txt content", () => {
+    const result = detectCloudflareChallenge(NORMAL_ROBOTS_TXT);
+    expect(result.isCloudflareProtected).toBe(false);
+  });
+
+  it("should set supportsWebBotAuth when server header indicates Cloudflare", () => {
+    const result = detectCloudflareChallenge(CF_MANAGED_CHALLENGE_HTML, {
+      server: "cloudflare",
+    });
+    expect(result.isCloudflareProtected).toBe(true);
+    expect(result.supportsWebBotAuth).toBe(true);
+  });
+
+  it("should set supportsWebBotAuth when cf-ray header is present", () => {
+    const result = detectCloudflareChallenge(CF_MANAGED_CHALLENGE_HTML, {
+      cfRay: "abc123-IAD",
+    });
+    expect(result.isCloudflareProtected).toBe(true);
+    expect(result.supportsWebBotAuth).toBe(true);
+  });
+
+  it("should not set supportsWebBotAuth when no Cloudflare headers are present", () => {
+    const result = detectCloudflareChallenge(CF_MANAGED_CHALLENGE_HTML);
+    expect(result.isCloudflareProtected).toBe(true);
+    expect(result.supportsWebBotAuth).toBeUndefined();
+  });
+
+  it("should handle empty string", () => {
+    const result = detectCloudflareChallenge("");
+    expect(result.isCloudflareProtected).toBe(false);
+  });
+});
+
+// ============================================================================
+// Web Bot Auth Helper Tests
+// ============================================================================
+
+describe("buildKeyDirectoryUrl", () => {
+  it("should build correct well-known URL from bare domain", () => {
+    expect(buildKeyDirectoryUrl("mybot.example.com")).toBe(
+      "https://mybot.example.com/.well-known/http-message-signatures-directory"
+    );
+  });
+
+  it("should strip protocol prefix", () => {
+    expect(buildKeyDirectoryUrl("https://mybot.example.com")).toBe(
+      "https://mybot.example.com/.well-known/http-message-signatures-directory"
+    );
+    expect(buildKeyDirectoryUrl("http://mybot.example.com")).toBe(
+      "https://mybot.example.com/.well-known/http-message-signatures-directory"
+    );
+  });
+
+  it("should strip trailing slashes", () => {
+    expect(buildKeyDirectoryUrl("mybot.example.com/")).toBe(
+      "https://mybot.example.com/.well-known/http-message-signatures-directory"
+    );
+  });
+});
+
+describe("validateWebBotAuthConfig", () => {
+  const validConfig = {
+    keyDirectoryUrl:
+      "https://mybot.example.com/.well-known/http-message-signatures-directory",
+    keyId: "poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U",
+    userAgent: "MyBot/1.0",
+  };
+
+  it("should accept a valid config", () => {
+    const result = validateWebBotAuthConfig(validConfig);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("should reject missing keyDirectoryUrl", () => {
+    const { keyDirectoryUrl, ...rest } = validConfig;
+    const result = validateWebBotAuthConfig(rest);
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("keyDirectoryUrl is required");
+  });
+
+  it("should reject non-HTTPS keyDirectoryUrl", () => {
+    const result = validateWebBotAuthConfig({
+      ...validConfig,
+      keyDirectoryUrl: "http://mybot.example.com/.well-known/http-message-signatures-directory",
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("keyDirectoryUrl must use HTTPS");
+  });
+
+  it("should warn if keyDirectoryUrl is missing well-known path", () => {
+    const result = validateWebBotAuthConfig({
+      ...validConfig,
+      keyDirectoryUrl: "https://mybot.example.com/keys",
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toContain("/.well-known/http-message-signatures-directory");
+  });
+
+  it("should reject missing keyId", () => {
+    const { keyId, ...rest } = validConfig;
+    const result = validateWebBotAuthConfig(rest);
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("keyId (JWK thumbprint) is required");
+  });
+
+  it("should reject missing userAgent", () => {
+    const { userAgent, ...rest } = validConfig;
+    const result = validateWebBotAuthConfig(rest);
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("userAgent is required");
+  });
+
+  it("should collect multiple errors", () => {
+    const result = validateWebBotAuthConfig({});
+    expect(result.valid).toBe(false);
+    expect(result.errors.length).toBe(3);
   });
 });

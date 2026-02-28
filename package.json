@@ -1,6 +1,6 @@
 {
   "name": "wuher",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "A robots.txt parser that classifies bot access rules. Named after the Mos Eisley cantina bartender who told Luke, \"Your droids. They can't come in here.\"",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -36,7 +36,10 @@
     "claude",
     "parser",
     "seo",
-    "web-crawling"
+    "web-crawling",
+    "cloudflare",
+    "web-bot-auth",
+    "sitemap"
   ],
   "author": "Orchestra AI, Inc.",
   "license": "MIT",
