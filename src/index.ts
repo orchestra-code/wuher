@@ -893,7 +893,7 @@ const CLOUDFLARE_MARKERS = {
   managed_challenge: [
     "cf_chl_opt",
     "cf-browser-verification",
-    "/cdn-cgi/challenge-platform",
+    "/cdn-cgi/challenge-platform/h/",
   ],
   turnstile: [
     "cf-turnstile",
